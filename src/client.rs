@@ -24,7 +24,7 @@ use crate::logger::LogEvent;
 /// * `config` - SDK configuration containing API key and base URL
 ///
 /// # Returns
-/// * `Ok(())` -  successfully
+/// * `Ok(())` - Log sent successfully
 /// * `Err(LogError)` - Network error, timeout, or server error
 pub async fn send(event: LogEvent, config: &Config) -> Result<(), LogError> {
     // Validate configuration before attempting to send
@@ -42,12 +42,21 @@ pub async fn send(event: LogEvent, config: &Config) -> Result<(), LogError> {
 
     // Convert log event to JSON for optional debug logging
     let json_payload = serde_json::to_string_pretty(&event)
-        .map_err(LogError::Serialization)?; // ✅ FIXED: remove `.to_string()`
+        .map_err(LogError::Serialization)?;
 
-    // Debug: print payload being sent if debug mode is enabled
+    // Debug: print full details if debug mode is enabled
     if config.debug {
-        println!("[LogSentinel SDK Debug] Sending payload to backend:\n{}", json_payload);
-        println!("[LogSentinel SDK Debug] Endpoint: {}", endpoint);
+        println!("\n========================================");
+        println!("[LogSentinel SDK Debug] Sending log to backend");
+        println!("========================================");
+        println!("Endpoint: {}", endpoint);
+        println!("Method: POST");
+        println!("Headers:");
+        println!("  Authorization: Bearer {}***", &api_key[..8.min(api_key.len())]);
+        println!("  Content-Type: application/json");
+        println!("\nPayload:");
+        println!("{}", json_payload);
+        println!("========================================\n");
     }
 
     // Send POST request with JSON payload and authentication
