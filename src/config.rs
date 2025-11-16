@@ -49,14 +49,20 @@ impl Config {
         let active = api_key.is_some() && base_url.is_some();
 
         if !active {
-            // Print warning to stderr, but continue without crashing
-            eprintln!(
-                "LogSentinel SDK disabled: missing LOGSENTINEL_API_KEY or LOGSENTINEL_BASE_URL environment variable"
-            );
+            // Detailed warnings for missing config
+            if api_key.is_none() && base_url.is_none() {
+                eprintln!("[LogSentinel] SDK DISABLED: Both LOGSENTINEL_API_KEY and LOGSENTINEL_BASE_URL environment variables are missing");
+            } else if api_key.is_none() {
+                eprintln!("[LogSentinel] SDK DISABLED: LOGSENTINEL_API_KEY environment variable is missing");
+            } else if base_url.is_none() {
+                eprintln!("[LogSentinel] SDK DISABLED: LOGSENTINEL_BASE_URL environment variable is missing");
+            }
+            eprintln!("[LogSentinel]  Set these variables to enable request logging");
         } else if debug {
-            println!("✓ LogSentinel SDK initialized successfully (debug mode active)");
+            println!("[LogSentinel] SDK initialized successfully (DEBUG MODE ACTIVE)");
+            println!("[LogSentinel] All requests will be logged to: {}", base_url.as_ref().unwrap());
         } else if cfg!(debug_assertions) {
-            println!("✓ LogSentinel SDK initialized successfully");
+            println!("[LogSentinel] SDK initialized successfully");
         }
 
         Self {
