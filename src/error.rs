@@ -27,6 +27,14 @@ pub enum LogError {
     /// Generic error for unexpected failures
     #[error("Unexpected error: {0}")]
     Other(String),
+
+    /// Application error captured from handler
+    #[error("Application error: {0}")]
+    ApplicationError(String),
+
+    /// Handler panicked
+    #[error("Handler panic: {0}")]
+    HandlerPanic(String),
 }
 
 impl LogError {
