@@ -6,20 +6,17 @@
 
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
-    web::Bytes,
     Error,
 };
 use futures::future::{ok, LocalBoxFuture, Ready};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Instant;
-use actix_web::body::MessageBody;
 
 use crate::config::Config;
 use crate::logger::{forward_log, LogEvent, RequestData, ResponseData};
-use crate::utils::{current_timestamp, extract_ip, generate_trace_id, truncate_body};
+use crate::utils::{current_timestamp, extract_ip, generate_trace_id};
+use crate::response_body_capture::capture_response_body;
 
 /// Maximum body size to capture (10KB)
 const MAX_BODY_SIZE: usize = 10 * 1024;
@@ -119,24 +116,9 @@ where
         // Generate unique trace ID for this request
         let trace_id = generate_trace_id();
 
-        // Capture request metadata before passing to handler
-        let request_data = capture_request_data(&req);
-
-        // Debug: print captured request data
-        if self.config.debug {
-            println!("[LogSentinel Debug] Request captured:");
-            println!("  Trace ID: {}", trace_id);
-            println!("  Method: {}", request_data.method);
-            println!("  Path: {}", request_data.path);
-            println!("  Headers: {:?}", request_data.headers);
-            if let Some(body) = &request_data.body {
-                println!("  Body: {}", body);
-            }
-            if let Some(ip) = &request_data.ip {
-                println!("  IP: {}", ip);
-            }
-        }
-
+        // Capture request metadata (body capture happens later)
+        let request_data = capture_request_data_with_body(&req, None);
+        
         // Clone config for async task
         let config = self.config.clone();
 
@@ -145,41 +127,8 @@ where
 
         // Process response asynchronously after handler completes
         Box::pin(async move {
-            // Await the response from the handler, capturing any errors
-            let res = match fut.await {
-                Ok(response) => response,
-                Err(error) => {
-                    // Capture the error before returning it
-                    let error_msg = format!("{:?}", error);
-                    
-                    if config.debug {
-                        println!("[LogSentinel Debug] Application error captured:");
-                        println!("  Error: {}", error_msg);
-                        println!("  Duration: {}ms", start_time.elapsed().as_millis());
-                    }
-                    
-                    // Log the error event
-                    let error_event = LogEvent::new(
-                        current_timestamp(),
-                        trace_id.clone(),
-                        request_data.clone(),
-                        ResponseData {
-                            status: 500,  // Assume 500 for handler errors
-                            headers: HashMap::new(),
-                            body: Some(error_msg.clone()),
-                            duration_ms: start_time.elapsed().as_millis() as u64,
-                        },
-                    );
-                    
-                    // Send error log in background
-                    tokio::spawn(async move {
-                        forward_log(error_event, config.clone()).await;
-                    });
-                    
-                    // Return the original error to Actix
-                    return Err(error);
-                }
-            };
+            // Await the response from the handler
+            let res = fut.await?;
 
             // Calculate request duration
             let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -187,40 +136,17 @@ where
             // Capture response status code
             let status = res.status().as_u16();
 
-            // Extract response headers
+            // Capture response headers
             let response_headers = extract_response_headers(&res);
 
-            // Debug: print captured response data
-            if config.debug {
-                println!("[LogSentinel Debug] Response captured:");
-                println!("  Status: {}", status);
-                println!("  Duration: {}ms", duration_ms);
-                println!("  Headers: {:?}", response_headers);
-            }
+            // Capture response body asynchronously (non-blocking)
+            let (modified_res, response_body) = capture_response_body(res).await;
 
-            // ============================================================
-            // RESPONSE BODY CAPTURE - DISABLED FOR NOW
-            // ============================================================
-            // TODO: Implement response body capture in future version
-            // 
-            // Challenges:
-            // - Must not consume or modify the response stream
-            // - Need to handle streaming responses (chunked encoding)
-            // - Large bodies need truncation without loading into memory
-            // - Binary content should be skipped (images, PDFs, etc.)
-            //
-            // Implementation approach:
-            // 1. Wrap response body in a tee stream that copies to buffer
-            // 2. Truncate buffer at MAX_BODY_SIZE (10KB)
-            // 3. Convert to string only if valid UTF-8
-            // 4. Skip if content-type is binary
-            // ============================================================
-
-            // For now, response body is always None
+            // Build response data with captured body
             let response_data = ResponseData {
                 status,
                 headers: response_headers,
-                body: None,  // TODO: Implement in future
+                body: response_body,
                 duration_ms,
             };
 
@@ -237,16 +163,16 @@ where
                 forward_log(event, config).await;
             });
 
-            Ok(res.map_into_boxed_body())
+            Ok(modified_res)
         })
     }
 }
 
-/// Capture request metadata from ServiceRequest
+/// Capture request metadata from ServiceRequest with optional body
 ///
 /// Extracts method, path, headers, and optional body.
 /// Headers are sanitized to remove sensitive auth tokens.
-fn capture_request_data(req: &ServiceRequest) -> RequestData {
+fn capture_request_data_with_body(req: &ServiceRequest, body: Option<String>) -> RequestData {
     // Extract basic request info
     let method = req.method().to_string();
     let path = req.path().to_string();
@@ -258,19 +184,6 @@ fn capture_request_data(req: &ServiceRequest) -> RequestData {
     let peer_addr = req.peer_addr().map(|addr| addr.to_string());
     let ip = extract_ip(&headers, peer_addr.as_deref());
 
-    // Capture request body if content-type is text-based
-    // Note: Request body capture is currently disabled because Actix-Web's ServiceRequest
-    // doesn't provide direct access to the body without consuming the payload stream.
-    // Implementing this requires a separate middleware layer that buffers the body
-    // before it reaches the handler, which adds complexity and memory overhead.
-    // 
-    // TODO: Implement request body capture in future version
-    // Possible approaches:
-    // 1. Add a body-buffering middleware layer before this middleware
-    // 2. Use request extensions to store the body captured by another middleware
-    // 3. Implement a custom payload extractor that clones the body
-    let body = None;
-
     RequestData {
         method,
         path,
@@ -279,33 +192,6 @@ fn capture_request_data(req: &ServiceRequest) -> RequestData {
         ip,
     }
 }
-
-// ============================================================
-// RESPONSE BODY WRAPPER - COMMENTED OUT (NOT USED CURRENTLY)
-// ============================================================
-// This function was causing compilation errors and is not needed
-// since response body capture is disabled for now.
-//
-// /// Wrap response body to capture it while streaming to client
-// ///
-// /// Returns the modified response and a BodyLogger that will capture the body
-// fn wrap_response_body<B>(
-//     res: ServiceResponse<B>,
-// ) -> (ServiceResponse<actix_web::body::BoxBody>, Arc<BodyLoggerState>)
-// where
-//     B: actix_web::body::MessageBody + 'static,
-// {
-//     let state = Arc::new(BodyLoggerState::new());
-//     let state_clone = state.clone();  // Clone BEFORE map_body to avoid move error
-//
-//     // Map the body to our logger and box it for type compatibility
-//     let mapped = res.map_body(move |_, body| {
-//         let logged_body = BodyLogger { body, state: state_clone.clone() };
-//         logged_body.boxed()
-//     });
-//
-//     (mapped, state)
-// }
 
 /// Extract and sanitize request headers
 ///
@@ -372,113 +258,6 @@ fn should_capture_body(headers: &HashMap<String, String>) -> bool {
         false
     }
 }
-
-// ============================================================
-// BODY LOGGING STRUCTURES - COMMENTED OUT (NOT USED CURRENTLY)
-// ============================================================
-// These structures were used for response body capture, which is
-// currently disabled. Keeping them commented for future implementation.
-//
-// /// State shared between BodyLogger and the async task
-// struct BodyLoggerState {
-//     buffer: tokio::sync::Mutex<Vec<u8>>,
-//     completed: tokio::sync::Notify,
-// }
-//
-// impl BodyLoggerState {
-//     fn new() -> Self {
-//         Self {
-//             buffer: tokio::sync::Mutex::new(Vec::new()),
-//             completed: tokio::sync::Notify::new(),
-//         }
-//     }
-//
-//     /// Wait for body capture to complete and return the captured body
-//     async fn get_captured_body(&self) -> Option<String> {
-//         // Wait for body to be fully captured
-//         self.completed.notified().await;
-//         
-//         let buffer = self.buffer.lock().await;
-//         
-//         // Convert to string if valid UTF-8
-//         if buffer.is_empty() {
-//             return None;
-//         }
-//         
-//         String::from_utf8(buffer.clone())
-//             .ok()
-//             .map(|s| truncate_body(&s, MAX_BODY_SIZE))
-//     }
-// }
-//
-// /// Body wrapper that captures response body while streaming to client
-// ///
-// /// This implements the MessageBody trait to intercept body chunks
-// /// as they're sent to the client, allowing us to capture them without
-// /// blocking or modifying the response.
-// struct BodyLogger<B> {
-//     body: B,
-//     state: Arc<BodyLoggerState>,
-// }
-//
-// impl<B> actix_web::body::MessageBody for BodyLogger<B>
-// where
-//     B: actix_web::body::MessageBody,
-// {
-//     type Error = B::Error;
-//
-//     fn size(&self) -> actix_web::body::BodySize {
-//         self.body.size()
-//     }
-//
-//     fn poll_next(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//     ) -> Poll<Option<Result<Bytes, Self::Error>>> {
-//         // SAFETY: We're not moving the body, just getting a mutable reference
-//         let this = unsafe { self.get_unchecked_mut() };
-//         let body = unsafe { Pin::new_unchecked(&mut this.body) };
-//         
-//         match body.poll_next(cx) {
-//             Poll::Ready(Some(Ok(chunk))) => {
-//                 // Capture chunk in background without blocking
-//                 let state = this.state.clone();
-//                 let chunk_clone = chunk.clone();
-//                 
-//                 tokio::spawn(async move {
-//                     let mut buffer = state.buffer.lock().await;
-//                     
-//                     // Only capture up to MAX_BODY_SIZE to avoid memory issues
-//                     if buffer.len() < MAX_BODY_SIZE {
-//                         let remaining = MAX_BODY_SIZE - buffer.len();
-//                         let to_capture = chunk_clone.len().min(remaining);
-//                         buffer.extend_from_slice(&chunk_clone[..to_capture]);
-//                     }
-//                 });
-//                 
-//                 Poll::Ready(Some(Ok(chunk)))
-//             }
-//             Poll::Ready(None) => {
-//                 // Body complete - notify waiting task
-//                 this.state.completed.notify_one();
-//                 Poll::Ready(None)
-//             }
-//             Poll::Ready(Some(Err(e))) => {
-//                 // Error occurred - notify waiting task
-//                 this.state.completed.notify_one();
-//                 Poll::Ready(Some(Err(e)))
-//             }
-//             Poll::Pending => Poll::Pending,
-//         }
-//     }
-//
-//     fn try_into_bytes(self) -> Result<Bytes, Self>
-//     where
-//         Self: Sized,
-//     {
-//         Err(self)
-//     }
-// }
 
 #[cfg(test)]
 mod tests {

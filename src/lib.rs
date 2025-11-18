@@ -69,6 +69,8 @@ pub mod error;
 pub mod logger;
 pub mod middleware;
 pub mod utils;
+pub mod request_body_capture;
+pub mod response_body_capture;
 
 // Re-export main components for easy access
 pub use config::Config;
